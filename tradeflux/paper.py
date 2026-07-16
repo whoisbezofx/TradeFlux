@@ -15,13 +15,15 @@ from dataclasses import dataclass, asdict, field
 class Trade:
     ts: float
     direction: str        # UP / DOWN
-    stake: float          # dollars risked
+    stake: float          # margin risked (dollars)
     entry_price: float    # BTC price at entry
     prob: float           # engine-implied probability
     settle_price: float = 0.0
     won: bool = False
     pnl: float = 0.0
     open: bool = True
+    leverage: float = 1.0     # position notional = stake * leverage
+    liquidated: bool = False  # True if an adverse move wiped the margin
 
 
 @dataclass
@@ -65,6 +67,50 @@ class PaperAccount:
         trade.open = False
         self.balance = round(self.balance + trade.pnl, 2)
 
+    # --- leveraged futures (paper) -------------------------------------
+    def open_futures(self, direction: str, prob: float, entry_price: float,
+                     leverage: float) -> Trade | None:
+        """Open a leveraged futures paper position.
+
+        Margin is sized with fractional Kelly, exactly like the binary path.
+        The notional exposure is margin * leverage.
+        """
+        margin = self.kelly_stake(prob)
+        if margin <= 0 or margin > self.balance:
+            return None
+        t = Trade(ts=time.time(), direction=direction, stake=margin,
+                  entry_price=entry_price, prob=prob, leverage=leverage)
+        self.trades.append(t)
+        return t
+
+    def settle_futures(self, trade: Trade, low: float, high: float,
+                       close: float, maint_margin: float = 0.005) -> None:
+        """Settle a futures position against an interval's real price action.
+
+        Liquidation model: if the adverse excursion (worst point of the
+        interval) reaches 1/leverage minus the maintenance margin, the whole
+        margin is gone — the standard way 100x accounts die on a routine move.
+        Otherwise P&L = margin * leverage * signed_move, minus fees.
+        """
+        e = trade.entry_price
+        adverse = (e - low) / e if trade.direction == "UP" else (high - e) / e
+        liq_threshold = max(1.0 / trade.leverage - maint_margin, 0.0)
+
+        if adverse >= liq_threshold:
+            trade.liquidated = True
+            trade.won = False
+            trade.pnl = -trade.stake            # full margin wiped
+            trade.settle_price = low if trade.direction == "UP" else high
+        else:
+            move = (close - e) / e if trade.direction == "UP" else (e - close) / e
+            gross = trade.stake * trade.leverage * move
+            fee = trade.stake * trade.leverage * self.fee_frac
+            trade.pnl = round(gross - fee, 2)
+            trade.won = trade.pnl > 0
+            trade.settle_price = close
+        trade.open = False
+        self.balance = round(self.balance + trade.pnl, 2)
+
     # --- reporting ------------------------------------------------------
     def closed(self) -> list[Trade]:
         return [t for t in self.trades if not t.open]
@@ -72,6 +118,7 @@ class PaperAccount:
     def stats(self) -> dict:
         closed = self.closed()
         wins = [t for t in closed if t.won]
+        liqs = [t for t in closed if t.liquidated]
         pnl = round(self.balance - self.starting, 2)
         return {
             "balance": self.balance,
@@ -81,6 +128,7 @@ class PaperAccount:
             "trades": len(closed),
             "wins": len(wins),
             "win_rate_pct": round(100 * len(wins) / len(closed), 1) if closed else 0.0,
+            "liquidations": len(liqs),
         }
 
     def save(self, path: str) -> None:
